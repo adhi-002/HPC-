@@ -1,171 +1,179 @@
 #include <mpi.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
+#include <vector>
+#include <iostream>
+#include <algorithm>
+#include <cstdlib>
+#include <ctime>
+#include <numeric>
 
-// Compare function for qsort
-int compare(const void *a, const void *b) {
-    return (*(int *)a - *(int *)b);
+// Check if local array is sorted
+bool isLocalSorted(const std::vector<long long> &arr) {
+    for (size_t i = 1; i < arr.size(); i++) {
+        if (arr[i-1] > arr[i]) return false;
+    }
+    return true;
 }
 
-int main(int argc, char *argv[]) {
-    int rank, size;
-    int n = 16;  // total data size
-    int *data = NULL;
+// Global correctness check
+bool verifyGlobalSort(const std::vector<long long> &local, int rank, int size, MPI_Comm comm) {
+    // 1. Check local sortedness
+    int localFlag = isLocalSorted(local) ? 1 : 0;
 
+    // Gather flags at root
+    int globalFlag = 1;
+    if (rank == 0) {
+        globalFlag = localFlag;
+        for (int r = 1; r < size; r++) {
+            int recvFlag;
+            MPI_Recv(&recvFlag, 1, MPI_INT, r, 10, comm, MPI_STATUS_IGNORE);
+            if (recvFlag == 0) globalFlag = 0;
+        }
+        // send result back
+        for (int r = 1; r < size; r++) {
+            MPI_Send(&globalFlag, 1, MPI_INT, r, 11, comm);
+        }
+    } else {
+        MPI_Send(&localFlag, 1, MPI_INT, 0, 10, comm);
+        MPI_Recv(&globalFlag, 1, MPI_INT, 0, 11, comm, MPI_STATUS_IGNORE);
+    }
+
+    if (globalFlag == 0) return false;
+
+    // 2. Check boundaries between ranks
+    if (rank < size-1 && !local.empty()) {
+        long long myLast = local.back();
+        MPI_Send(&myLast, 1, MPI_LONG_LONG, rank+1, 20, comm);
+    }
+    if (rank > 0 && !local.empty()) {
+        long long prevLast;
+        MPI_Recv(&prevLast, 1, MPI_LONG_LONG, rank-1, 20, comm, MPI_STATUS_IGNORE);
+        if (prevLast > local.front()) return false;
+    }
+
+    return true;
+}
+
+
+// Parallel sample sort function
+void parallelSampleSort(long long n, int rank, int size, MPI_Comm comm, std::vector<long long> &localData) {
+    // Step 1: distribute responsibility for generating data
+    long long local_n = n / size;
+    if (rank < n % size) local_n++;
+
+    localData.resize(local_n);
+    srand(time(NULL) + rank); // different seed per rank
+    for (long long i = 0; i < local_n; i++) {
+        localData[i] = rand() % 1000000000LL;
+    }
+
+    // Step 2: local sort
+    std::sort(localData.begin(), localData.end());
+
+    // Step 3: choose samples
+    int s = size - 1;
+    std::vector<long long> samples;
+    if (!localData.empty()) {
+        for (int i = 1; i <= s; i++) {
+            samples.push_back(localData[local_n * i / (s+1)]);
+        }
+    }
+
+    // Gather samples to root (rank 0) manually (no collectives)
+    std::vector<long long> allSamples;
+    if (rank == 0) {
+        allSamples.resize(s * size);
+        int idx = 0;
+        for (int r = 0; r < size; r++) {
+            if (r == 0) {
+                for (auto v : samples) allSamples[idx++] = v;
+            } else {
+                int recvCount = s;
+                MPI_Recv(allSamples.data()+idx, recvCount, MPI_LONG_LONG, r, 1, comm, MPI_STATUS_IGNORE);
+                idx += recvCount;
+            }
+        }
+    } else {
+        MPI_Send(samples.data(), s, MPI_LONG_LONG, 0, 1, comm);
+    }
+
+    // Step 4: choose global pivots
+    std::vector<long long> pivots(s);
+    if (rank == 0) {
+        std::sort(allSamples.begin(), allSamples.end());
+        for (int i = 1; i <= s; i++) {
+            pivots[i-1] = allSamples[allSamples.size() * i / (s+1)];
+        }
+        // broadcast pivots
+        for (int r = 1; r < size; r++) {
+            MPI_Send(pivots.data(), s, MPI_LONG_LONG, r, 2, comm);
+        }
+    } else {
+        MPI_Recv(pivots.data(), s, MPI_LONG_LONG, 0, 2, comm, MPI_STATUS_IGNORE);
+    }
+
+    // Step 5: partition local data
+    std::vector<std::vector<long long>> buckets(size);
+    int idx = 0;
+    for (auto v : localData) {
+        while (idx < s && v > pivots[idx]) idx++;
+        buckets[idx].push_back(v);
+    }
+
+    // Step 6: exchange buckets
+    std::vector<long long> recvData;
+    for (int r = 0; r < size; r++) {
+        if (r == rank) continue;
+        // send count then data
+        long long count = buckets[r].size();
+        MPI_Send(&count, 1, MPI_LONG_LONG, r, 3, comm);
+        if (count > 0) MPI_Send(buckets[r].data(), count, MPI_LONG_LONG, r, 4, comm);
+    }
+
+    // also keep own bucket
+    recvData.insert(recvData.end(), buckets[rank].begin(), buckets[rank].end());
+
+    // receive from others
+    for (int r = 0; r < size; r++) {
+        if (r == rank) continue;
+        long long count;
+        MPI_Recv(&count, 1, MPI_LONG_LONG, r, 3, comm, MPI_STATUS_IGNORE);
+        if (count > 0) {
+            std::vector<long long> temp(count);
+            MPI_Recv(temp.data(), count, MPI_LONG_LONG, r, 4, comm, MPI_STATUS_IGNORE);
+            recvData.insert(recvData.end(), temp.begin(), temp.end());
+        }
+    }
+
+    // Step 7: final local sort
+    std::sort(recvData.begin(), recvData.end());
+    localData.swap(recvData);
+}
+
+// Scaling experiment
+void testScaling(int rank, int size, MPI_Comm comm) {
+    std::vector<long long> localData;
+    std::vector<int> testSizes = {100}; // 10^6 to 10^8 (adjustable)
+    // 10^10 is possible but very large for demo, test with smaller then scale up
+    for (auto n : testSizes) {
+        double start = MPI_Wtime();
+        parallelSampleSort(n, rank, size, comm, localData);
+        double end = MPI_Wtime();
+
+        bool correct = verifyGlobalSort(localData, rank, size, comm);
+        if (rank == 0) {
+            std::cout << "n=" << n << ", time=" << (end-start) 
+                      << "s, correct=" << (correct ? "✅" : "❌") << std::endl;
+        }
+    }
+}
+
+int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
+    int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    int local_n = n / size;
-    int *local_data = malloc(local_n * sizeof(int));
-
-    if (rank == 0) {
-        data = malloc(n * sizeof(int));
-        srand(time(NULL));
-        printf("Unsorted data: ");
-        for (int i = 0; i < n; i++) {
-            data[i] = rand() % 100;
-            printf("%d ", data[i]);
-        }
-        printf("\n");
-
-        // Scatter manually using point-to-point
-        for (int p = 1; p < size; p++) {
-            MPI_Send(data + p * local_n, local_n, MPI_INT, p, 0, MPI_COMM_WORLD);
-        }
-        // Copy my own chunk
-        for (int i = 0; i < local_n; i++)
-            local_data[i] = data[i];
-    } else {
-        MPI_Recv(local_data, local_n, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    }
-
-    // Step 1: Local sort
-    qsort(local_data, local_n, sizeof(int), compare);
-
-    // Step 2: Choose local samples
-    int s = size - 1;  // number of samples per process
-    int *samples = malloc(s * sizeof(int));
-    for (int i = 0; i < s; i++) {
-        samples[i] = local_data[(i + 1) * local_n / size];
-    }
-
-    // Gather samples at root
-    int *all_samples = NULL;
-    if (rank == 0) all_samples = malloc(s * size * sizeof(int));
-
-    if (rank == 0) {
-        // Copy root samples
-        for (int i = 0; i < s; i++)
-            all_samples[i] = samples[i];
-
-        // Receive from others
-        for (int p = 1; p < size; p++) {
-            MPI_Recv(all_samples + p * s, s, MPI_INT, p, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        }
-    } else {
-        MPI_Send(samples, s, MPI_INT, 0, 1, MPI_COMM_WORLD);
-    }
-
-    // Step 3: Root chooses splitters
-    int *splitters = malloc((size - 1) * sizeof(int));
-    if (rank == 0) {
-        qsort(all_samples, s * size, sizeof(int), compare);
-        for (int i = 0; i < size - 1; i++) {
-            splitters[i] = all_samples[(i + 1) * size];
-        }
-    }
-
-    // Broadcast splitters manually
-    if (rank == 0) {
-        for (int p = 1; p < size; p++) {
-            MPI_Send(splitters, size - 1, MPI_INT, p, 2, MPI_COMM_WORLD);
-        }
-    } else {
-        MPI_Recv(splitters, size - 1, MPI_INT, 0, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    }
-
-    // Step 4: Partition local data based on splitters
-    int *send_counts = calloc(size, sizeof(int));
-    int *positions = calloc(size, sizeof(int));
-    for (int i = 0; i < local_n; i++) {
-        int val = local_data[i];
-        int p = 0;
-        while (p < size - 1 && val > splitters[p]) p++;
-        send_counts[p]++;
-    }
-
-    int **send_data = malloc(size * sizeof(int *));
-    for (int p = 0; p < size; p++) {
-        send_data[p] = malloc(send_counts[p] * sizeof(int));
-    }
-
-    for (int i = 0; i < local_n; i++) {
-        int val = local_data[i];
-        int p = 0;
-        while (p < size - 1 && val > splitters[p]) p++;
-        send_data[p][positions[p]++] = val;
-    }
-
-    // Step 5: Exchange partitions
-    int *recv_counts = malloc(size * sizeof(int));
-    for (int p = 0; p < size; p++) {
-        if (p != rank) {
-            MPI_Send(&send_counts[p], 1, MPI_INT, p, 3, MPI_COMM_WORLD);
-            MPI_Recv(&recv_counts[p], 1, MPI_INT, p, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        } else {
-            recv_counts[p] = send_counts[p];
-        }
-    }
-
-    int total_recv = 0;
-    for (int p = 0; p < size; p++) total_recv += recv_counts[p];
-    int *recv_data = malloc(total_recv * sizeof(int));
-
-    int offset = 0;
-    for (int p = 0; p < size; p++) {
-        if (p != rank) {
-            MPI_Send(send_data[p], send_counts[p], MPI_INT, p, 4, MPI_COMM_WORLD);
-            MPI_Recv(recv_data + offset, recv_counts[p], MPI_INT, p, 4, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            offset += recv_counts[p];
-        } else {
-            for (int i = 0; i < recv_counts[p]; i++)
-                recv_data[offset++] = send_data[p][i];
-        }
-    }
-
-    // Step 6: Final sort
-    qsort(recv_data, total_recv, sizeof(int), compare);
-
-    // Gather results back to root for display
-    if (rank == 0) {
-        int *sizes = malloc(size * sizeof(int));
-        sizes[0] = total_recv;
-        for (int p = 1; p < size; p++) {
-            MPI_Recv(&sizes[p], 1, MPI_INT, p, 5, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        }
-
-        int total = sizes[0];
-        for (int p = 1; p < size; p++) total += sizes[p];
-
-        int *final = malloc(total * sizeof(int));
-        int pos = 0;
-        for (int i = 0; i < total_recv; i++) final[pos++] = recv_data[i];
-
-        for (int p = 1; p < size; p++) {
-            MPI_Recv(final + pos, sizes[p], MPI_INT, p, 6, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            pos += sizes[p];
-        }
-
-        printf("Sorted data: ");
-        for (int i = 0; i < total; i++) printf("%d ", final[i]);
-        printf("\n");
-
-    } else {
-        MPI_Send(&total_recv, 1, MPI_INT, 0, 5, MPI_COMM_WORLD);
-        MPI_Send(recv_data, total_recv, MPI_INT, 0, 6, MPI_COMM_WORLD);
-    }
+    testScaling(rank, size, MPI_COMM_WORLD);
 
     MPI_Finalize();
     return 0;
